@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         arXiv 检索缓存区 & 批量下载器
+// @name         ArXiv论文下载器
 // @namespace    arxiv-cache-downloader
-// @version      1.3
+// @version      1.3.1
 // @description  arXiv 检索结果缓存区：跨检索累积、实时查看、可编辑 LLM 留言、纯文本/XML格式切换、生成 aria2 下载脚本
 // @match        https://arxiv.org/search/*
 // @grant        GM_setClipboard
@@ -9,8 +9,34 @@
 // @run-at       document-idle
 // ==/UserScript==
 
+// 副作用：
+// - 读写 localStorage：arxiv_paper_cache / arxiv_llm_message / arxiv_format_mode
+// - 剪贴板：GM_setClipboard；不可用时回退 navigator.clipboard
+// - 通知：GM_notification（可用时）
+// - 注入 #axc-panel / #axc-toast 与一段 <style> 到页面
+// - 生成并下载 download_arxiv.bat
+// - 未使用 unsafeWindow / eval / @require
+// - 调试命名空间：window.__arxiv_debug__（可 delete 清理）
+
+// 控制台定位本脚本问题：
+// 1. F12 → Console → 过滤框输入 [arxiv-cache]
+// 2. 展开红色 error 行堆栈，点击跳到 Sources 对应行
+// 3. 在 addCurrentPage / buildLLMText / generateBat / toClipboard 处下断点
+// 4. 检查内部状态：Console 输入 __arxiv_debug__.state
+
 (function () {
   'use strict';
+
+  if (window.__arxiv_loaded__) return;
+  window.__arxiv_loaded__ = true;
+
+  const TAG = '[arxiv-cache]';
+  const debug = (window.__arxiv_debug__ = {
+    state: { cacheSize: 0, lastAction: '', lastError: null },
+    log: (...a) => console.debug(TAG, ...a),
+    warn: (...a) => console.warn(TAG, ...a),
+    error: (...a) => console.error(TAG, ...a),
+  });
 
   const CACHE_KEY   = 'arxiv_paper_cache';
   const MSG_KEY     = 'arxiv_llm_message';
@@ -21,20 +47,46 @@
 
   // ---------- 数据层 ----------
   const loadCache = () => {
-    try { return JSON.parse(localStorage.getItem(CACHE_KEY)) || []; }
-    catch (e) { return []; }
+    try {
+      const parsed = JSON.parse(localStorage.getItem(CACHE_KEY)) || [];
+      const cache = Array.isArray(parsed) ? parsed : [];
+      debug.state.cacheSize = cache.length;
+      return cache;
+    } catch (e) {
+      debug.error('loadCache failed', e);
+      debug.state.lastError = e;
+      return [];
+    }
   };
   const saveCache = (cache) => {
-    cache.forEach((p, i) => (p.index = i + 1));
-    localStorage.setItem(CACHE_KEY, JSON.stringify(cache));
+    try {
+      cache.forEach((p, i) => (p.index = i + 1));
+      localStorage.setItem(CACHE_KEY, JSON.stringify(cache));
+      debug.state.cacheSize = cache.length;
+    } catch (e) {
+      debug.error('saveCache failed', e);
+      debug.state.lastError = e;
+    }
     return cache;
   };
 
-  const loadMsg = () => localStorage.getItem(MSG_KEY) ?? DEFAULT_MSG;
-  const saveMsg = (m) => localStorage.setItem(MSG_KEY, m);
+  const loadMsg = () => {
+    try { return localStorage.getItem(MSG_KEY) ?? DEFAULT_MSG; }
+    catch (e) { debug.error('loadMsg failed', e); return DEFAULT_MSG; }
+  };
+  const saveMsg = (m) => {
+    try { localStorage.setItem(MSG_KEY, m); }
+    catch (e) { debug.error('saveMsg failed', e); }
+  };
 
-  const loadFormatMode = () => localStorage.getItem(FORMAT_KEY) || 'text';
-  const saveFormatMode = (m) => localStorage.setItem(FORMAT_KEY, m);
+  const loadFormatMode = () => {
+    try { return localStorage.getItem(FORMAT_KEY) || 'text'; }
+    catch (e) { debug.error('loadFormatMode failed', e); return 'text'; }
+  };
+  const saveFormatMode = (m) => {
+    try { localStorage.setItem(FORMAT_KEY, m); }
+    catch (e) { debug.error('saveFormatMode failed', e); }
+  };
 
   const clean = (el) => {
     if (!el) return '';
@@ -75,6 +127,8 @@
     });
 
     saveCache(cache);
+    debug.state.lastAction = 'addCurrentPage';
+    debug.log('added current page', { added, skipped, total: cache.length });
     return { added, skipped, total: cache.length };
   };
 
@@ -199,13 +253,15 @@ Abstract: ${p.abstract}`);
     try {
       if (typeof GM_notification === 'function') {
         GM_notification({
-          title: ok ? 'arXiv 缓存区' : 'arXiv 缓存区 — 出错',
+          title: ok ? 'ArXiv论文下载器' : 'ArXiv论文下载器 — 出错',
           text,
           timeout: 3500,
           silent: true
         });
       }
-    } catch (e) { /* ignore */ }
+    } catch (e) {
+      debug.warn('GM_notification failed', e);
+    }
   };
 
   const toClipboard = (text, okMsg) => {
@@ -213,13 +269,19 @@ Abstract: ${p.abstract}`);
       if (typeof GM_setClipboard === 'function') {
         GM_setClipboard(text, 'text');
         showToast(okMsg, true);
-      } else {
-        throw new Error('GM_setClipboard not available');
+        debug.state.lastAction = 'clipboard:gm';
+        return;
       }
+      throw new Error('GM_setClipboard not available');
     } catch (e) {
+      debug.warn('GM_setClipboard unavailable, fallback to navigator.clipboard', e);
       navigator.clipboard.writeText(text)
-        .then(() => showToast(okMsg, true))
-        .catch(() => showToast('复制失败，请检查剪贴板权限', false));
+        .then(() => { debug.state.lastAction = 'clipboard:navigator'; showToast(okMsg, true); })
+        .catch((err) => {
+          debug.error('navigator.clipboard failed', err);
+          debug.state.lastError = err;
+          showToast('复制失败，请检查剪贴板权限', false);
+        });
     }
   };
 
@@ -261,7 +323,7 @@ Abstract: ${p.abstract}`);
   panel.id = 'axc-panel';
   panel.innerHTML = `
     <div id="axc-head">
-      <b>📚 arXiv 缓存区</b>
+      <b>📚 ArXiv论文下载器</b>
       <button id="axc-toggle">—</button>
     </div>
     <div class="axc-body">
@@ -311,6 +373,7 @@ Abstract: ${p.abstract}`);
 
   const refreshView = () => {
     const cache = loadCache();
+    debug.state.cacheSize = cache.length;
     $('#axc-stat').textContent = `缓存区共 ${cache.length} 篇`;
     $('#axc-view').value = cache.length
       ? cache.map(p => `[${p.index}] ${p.title}  (${p.arxivId})`).join('\n')
@@ -350,7 +413,8 @@ Abstract: ${p.abstract}`);
 
   $('#axc-clear').onclick = () => {
     if (confirm('确定清空缓存区、开始新任务吗？')) {
-      localStorage.removeItem(CACHE_KEY);
+      try { localStorage.removeItem(CACHE_KEY); }
+      catch (e) { debug.error('clear cache failed', e); showToast('清空失败，请检查存储权限', false); return; }
       refreshView();
       showToast('已清空，可以开始新任务', true);
     }
@@ -415,6 +479,16 @@ Abstract: ${p.abstract}`);
     });
     document.addEventListener('mouseup', () => dragging = false);
   })();
+
+  window.__arxiv_teardown__ = () => {
+    panel.remove();
+    style.remove();
+    document.getElementById('axc-toast')?.remove();
+    debug.log('teardown done');
+    delete window.__arxiv_loaded__;
+    delete window.__arxiv_debug__;
+    delete window.__arxiv_teardown__;
+  };
 
   refreshView();
 })();

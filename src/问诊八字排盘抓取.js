@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         八字排盘整块抓取器
+// @name         问诊八字排盘抓取
 // @namespace    http://tampermonkey.net/
-// @version      2026.09.18.5
+// @version      2026.11.09.1
 // @description  抓取 .pro-pan-content 整块（主表 + 起运 + 大运/流年/流月 + 五行），导出 Markdown / JSON
 // @author       You
 // @match        https://pcbz.iwzwh.com/index.html*
@@ -10,8 +10,30 @@
 // @run-at       document-idle
 // ==/UserScript==
 
+// 副作用：
+// - 只读 DOM：.pro-pan-content 及其子结构
+// - 写 localStorage：bz-panel-pos-v5（面板位置）
+// - 注入 #bz-panel 与一段 <style> 到页面
+// - 复制到剪贴板：navigator.clipboard，失败时回退 execCommand
+// - 未使用 GM_* / unsafeWindow / eval / @require
+// - 调试命名空间：window.__bazi_debug__（可 delete 清理）
+
+// 控制台定位本脚本问题：
+// 1. F12 → Console → 过滤框输入 [bazi]
+// 2. 展开红色 error 行堆栈，点击跳到 Sources 对应行
+// 3. 在 readPanel / readWithRetry / toMarkdown / boot 处下断点
+// 4. 检查内部状态：Console 输入 __bazi_debug__.state
+
 (function () {
   'use strict';
+
+  const TAG = '[bazi]';
+  const debug = (window.__bazi_debug__ = {
+    state: { lastRows: 0, lastReadAt: null, lastError: null },
+    log: (...a) => console.debug(TAG, ...a),
+    warn: (...a) => console.warn(TAG, ...a),
+    error: (...a) => console.error(TAG, ...a),
+  });
 
   /* ============ 1. 常量 ============ */
 
@@ -143,6 +165,8 @@
       wuxing:  readWuxing(root),
     };
     if (!data.header.length && !data.yun.length && !data.wuxing.length) return null;
+    debug.state.lastRows = data.header.length + data.yun.reduce((a, g) => a + g.items.length, 0);
+    debug.state.lastReadAt = new Date().toISOString();
     return data;
   }
 
@@ -225,6 +249,7 @@
         color:${TOKENS.accent};text-align:center;}
     `;
     const s = document.createElement('style');
+    s.id = 'bz-style';
     s.textContent = css;
     document.head.appendChild(s);
   }
@@ -235,7 +260,7 @@
     const panel = document.createElement('div');
     panel.id = 'bz-panel';
     panel.innerHTML = `
-      <div class="bz-bar"><span><span class="bz-dot"></span>八字抓取 v5</span><span>⠿</span></div>
+      <div class="bz-bar"><span><span class="bz-dot"></span>问诊八字排盘抓取</span><span>⠿</span></div>
       <div class="bz-body">
         <button data-act="scrape" class="bz-full">读取整块</button>
         <button data-act="md">复制 MD</button>
@@ -243,7 +268,9 @@
         <div class="bz-status"></div>
       </div>`;
 
-    const saved = JSON.parse(localStorage.getItem(POS_KEY) || 'null');
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem(POS_KEY) || 'null'); }
+    catch (err) { debug.warn('load panel position failed, use default', err); }
     const setPos = (x, y) => {
       const w = panel.offsetWidth || 220, h = panel.offsetHeight || 100;
       panel.style.left  = clamp(x, 0, innerWidth  - w) + 'px';
@@ -268,7 +295,7 @@
       if (!drag) return; drag = false;
       const r = panel.getBoundingClientRect();
       localStorage.setItem(POS_KEY, JSON.stringify({ x: r.left, y: r.top }));
-      try { bar.releasePointerCapture(e.pointerId); } catch (_) {}
+      try { bar.releasePointerCapture(e.pointerId); } catch (err) { debug.warn('releasePointerCapture failed', err); }
     };
     bar.addEventListener('pointerup', end);
     bar.addEventListener('pointercancel', end);
@@ -287,7 +314,8 @@
 
   async function copy(text) {
     try { await navigator.clipboard.writeText(text); return true; }
-    catch (_) {
+    catch (err) {
+      debug.warn('navigator.clipboard failed, fallback to execCommand', err);
       const ta = document.createElement('textarea');
       ta.value = text; ta.style.cssText = 'position:fixed;opacity:0';
       document.body.appendChild(ta); ta.select();
@@ -300,7 +328,14 @@
       let tries = 0;
       const tick = () => {
         const data = readPanel();
-        if (data || ++tries >= maxTries) return resolve(data);
+        if (data) {
+          debug.log('readPanel ok', { tries: tries + 1 });
+          return resolve(data);
+        }
+        if (++tries >= maxTries) {
+          debug.warn('readPanel timeout', { maxTries, interval });
+          return resolve(null);
+        }
         setTimeout(tick, interval);
       };
       tick();
@@ -308,9 +343,13 @@
   }
 
   function boot() {
+    if (window.__bazi_loaded__) { debug.warn('already loaded, skip'); return; }
+    window.__bazi_loaded__ = true;
     injectStyle();
     const panel = makePanel();
+    if (!document.body) { debug.error('document.body missing, mount aborted'); return; }
     document.body.appendChild(panel);
+    debug.log('mounted');
     let cache = null;
 
     panel.addEventListener('click', async (e) => {
@@ -332,6 +371,16 @@
       toast(panel, ok ? '已复制到剪贴板' : '复制失败', ok);
     });
   }
+
+  window.__bazi_teardown__ = () => {
+    document.getElementById('bz-panel')?.remove();
+    document.getElementById('bz-style')?.remove();
+    clearTimeout(toast._t);
+    delete window.__bazi_loaded__;
+    delete window.__bazi_debug__;
+    delete window.__bazi_teardown__;
+    console.info(TAG, 'teardown done');
+  };
 
   if (document.readyState === 'complete') boot();
   else window.addEventListener('load', boot);
